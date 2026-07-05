@@ -466,7 +466,7 @@ func TestAddrIndexRemoveEntriesAboveBlockID(t *testing.T) {
 	}
 	defer db.Close()
 
-	idx := NewAddrIndex(db, nil)
+	idx := NewAddrIndex(db, nil, "")
 	err = db.Update(func(dbTx database.Tx) error {
 		return idx.Create(dbTx)
 	})

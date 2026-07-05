@@ -7,6 +7,8 @@ package indexers
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -610,6 +612,9 @@ type AddrIndex struct {
 	db          database.DB
 	chainParams *chaincfg.Params
 
+	// dataDir is the directory the fast build stages its work in.
+	dataDir string
+
 	// The following fields are used to quickly link transactions and
 	// addresses that have not been included into a block yet when an
 	// address index is being maintained.  The are protected by the
@@ -633,6 +638,9 @@ var _ Indexer = (*AddrIndex)(nil)
 
 // Ensure the AddrIndex type implements the NeedsInputser interface.
 var _ NeedsInputser = (*AddrIndex)(nil)
+
+// Ensure the AddrIndex type implements the FastBuilder interface.
+var _ FastBuilder = (*AddrIndex)(nil)
 
 // NeedsInputs signals that the index requires the referenced inputs in order
 // to properly create the index.
@@ -971,6 +979,67 @@ func (idx *AddrIndex) UnconfirmedTxnsForAddress(addr address.Address) []*btcutil
 	return nil
 }
 
+// FastBuild bulk-builds the address index from the chain in a single parallel
+// pass and persists the index tip.  An index that already has data is extended
+// from its current tip rather than rebuilt, and when that tip is close enough
+// to the best chain tip that the per-block catchup is the cheaper way to close
+// the gap, it returns without building anything.  It implements the
+// FastBuilder interface so the index manager can build the index this way
+// instead of block by block.
+func (idx *AddrIndex) FastBuild(chain *blockchain.BlockChain,
+	interrupt <-chan struct{}) error {
+
+	var (
+		tipHash   *chainhash.Hash
+		tipHeight int32
+	)
+	err := idx.db.View(func(dbTx database.Tx) error {
+		var err error
+		tipHash, tipHeight, err = dbFetchIndexerTip(dbTx, addrIndexKey)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	// Leave a small gap to the per-block catchup.  Staging on disk means an
+	// earlier build was interrupted, and it has to be finished, or its
+	// leftovers removed, before the incremental path can safely append, so
+	// the build always proceeds then.
+	if tipHeight >= 0 {
+		_, stagingExists := AddrIndexFastBuildStaging(idx.dataDir)
+		behind := chain.BestSnapshot().Height - tipHeight
+		if behind < addrBuildMinBlocks && !stagingExists {
+			return nil
+		}
+	}
+
+	log.Warnf("Older btcd versions cannot detect a partially built address " +
+		"index and will silently corrupt it. If this build is interrupted, " +
+		"drop the index with --dropaddrindex before downgrading btcd")
+
+	builtHash, builtHeight, err := idx.buildAddrIndexFromChain(chain,
+		idx.dataDir, tipHeight, *tipHash, 0, interrupt)
+	if err != nil {
+		return err
+	}
+
+	err = idx.db.Update(func(dbTx database.Tx) error {
+		return dbPutIndexerTip(dbTx, addrIndexKey, &builtHash, builtHeight)
+	})
+	if err != nil {
+		return err
+	}
+
+	// Entries the build wrote beyond the previous tip are only stripped or
+	// replayed while the staging is on disk, so the tip is written before
+	// the staging is removed.
+	//
+	// Remove the whole build directory rather than just the staging inside
+	// it, so a completed build leaves nothing behind in the data dir.
+	return os.RemoveAll(filepath.Join(idx.dataDir, addrIndexBuildDirName))
+}
+
 // NewAddrIndex returns a new instance of an indexer that is used to create a
 // mapping of all addresses in the blockchain to the respective transactions
 // that involve them.
@@ -978,10 +1047,13 @@ func (idx *AddrIndex) UnconfirmedTxnsForAddress(addr address.Address) []*btcutil
 // It implements the Indexer interface which plugs into the IndexManager that in
 // turn is used by the blockchain package.  This allows the index to be
 // seamlessly maintained along with the chain.
-func NewAddrIndex(db database.DB, chainParams *chaincfg.Params) *AddrIndex {
+func NewAddrIndex(db database.DB, chainParams *chaincfg.Params,
+	dataDir string) *AddrIndex {
+
 	return &AddrIndex{
 		db:          db,
 		chainParams: chainParams,
+		dataDir:     dataDir,
 		txnsByAddr:  make(map[[addrKeySize]byte]map[chainhash.Hash]*btcutil.Tx),
 		addrsByTx:   make(map[chainhash.Hash]map[[addrKeySize]byte]struct{}),
 	}
@@ -989,8 +1061,14 @@ func NewAddrIndex(db database.DB, chainParams *chaincfg.Params) *AddrIndex {
 
 // DropAddrIndex drops the address index from the provided database if it
 // exists.
-func DropAddrIndex(db database.DB, interrupt <-chan struct{}) error {
-	return dropIndex(db, addrIndexKey, addrIndexName, interrupt)
+func DropAddrIndex(db database.DB, dataDir string, interrupt <-chan struct{}) error {
+	if err := dropIndex(db, addrIndexKey, addrIndexName, interrupt); err != nil {
+		return err
+	}
+
+	// Remove any fast build staging left on disk, which lives outside the
+	// database.
+	return os.RemoveAll(filepath.Join(dataDir, addrIndexBuildDirName))
 }
 
 // AddrIndexInitialized returns true if the address index has been created previously.

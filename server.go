@@ -2952,7 +2952,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 	if cfg.AddrIndex {
 		indxLog.Info("Address index is enabled")
-		s.addrIndex = indexers.NewAddrIndex(db, chainParams)
+		s.addrIndex = indexers.NewAddrIndex(db, chainParams, cfg.DataDir)
 		indexes = append(indexes, s.addrIndex)
 	}
 	if !cfg.NoCFilters {
