@@ -11,9 +11,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -42,6 +44,12 @@ const (
 	// the highest checkpointed scan height and the block the scan is
 	// targeting.
 	addrBuildManifestName = "manifest"
+
+	// addrBuildWriteBatchBytes is the approximate number of value bytes buffered
+	// before a database transaction is committed during the write phase.  It
+	// bounds the memory a single transaction holds since address index values
+	// vary widely in size.
+	addrBuildWriteBatchBytes = 32 * 1024 * 1024
 )
 
 // addrBuildManifestMagic identifies the serialized address index scan
@@ -283,4 +291,314 @@ func readAddrBuildManifest(stagingDir string) (addrBuildManifest, bool) {
 	copy(manifest.baseHash[:], data[17:17+chainhash.HashSize])
 	copy(manifest.targetHash[:], data[17+chainhash.HashSize:])
 	return manifest, true
+}
+
+// memAddrBucket is an in-memory internalBucket used to replay one address key's
+// entries through dbPutAddrIndexEntry so the write phase produces the same level
+// keys and values the incremental path would.
+type memAddrBucket struct {
+	levels map[[levelKeySize]byte][]byte
+}
+
+// Get returns the value associated with the key.
+//
+// This is part of the internalBucket interface.
+func (b *memAddrBucket) Get(key []byte) []byte {
+	var levelKey [levelKeySize]byte
+	copy(levelKey[:], key)
+	return b.levels[levelKey]
+}
+
+// Put stores a copy of the provided key/value pair.  The value is copied so the
+// caller may reuse or mutate the passed slice, and so the emitted level values
+// remain valid after the bucket is reset.
+//
+// This is part of the internalBucket interface.
+func (b *memAddrBucket) Put(key []byte, value []byte) error {
+	var levelKey [levelKeySize]byte
+	copy(levelKey[:], key)
+	stored := make([]byte, len(value))
+	copy(stored, value)
+	b.levels[levelKey] = stored
+	return nil
+}
+
+// Delete removes the provided key.
+//
+// This is part of the internalBucket interface.
+func (b *memAddrBucket) Delete(key []byte) error {
+	var levelKey [levelKeySize]byte
+	copy(levelKey[:], key)
+	delete(b.levels, levelKey)
+	return nil
+}
+
+// reset clears the bucket so it can be reused for the next address key.
+func (b *memAddrBucket) reset() {
+	clear(b.levels)
+}
+
+// emitAddrLevelEntries sorts the records, groups them by address key, replays
+// each group through dbPutAddrIndexEntry against memBucket, and invokes emit for
+// every produced level key in ascending level order.  Replaying the sorted
+// entries through the same routine the incremental path uses is what makes the
+// emitted level keys and values byte-identical to a block-by-block build.
+// memBucket is reused across groups and must be non-nil.
+//
+// A build that extends an existing index provides the level values every
+// address already has in the database via existing, along with the block id of
+// the base the build extends.  Each group's replay then starts from those
+// levels after stripping any entries beyond the base, which an interrupted
+// write of the same staging may have merged already.  Level values that end up
+// unchanged are not emitted, and a seeded level that no longer exists is
+// emitted with a nil value so the caller deletes it.
+//
+// addrDone, when non-nil, is invoked after each address's emissions.  It gives
+// the caller a safe point to commit what has been emitted so far, since
+// committing only part of an address would leave a mix of old and new level
+// values for a resumed build to seed its replay from.
+func emitAddrLevelEntries(records []addrRecord,
+	existing map[[addrKeySize]byte][][]byte, baseBlockID uint32,
+	memBucket *memAddrBucket,
+	emit func(key [levelKeySize]byte, value []byte) error,
+	addrDone func() error) error {
+
+	sort.Slice(records, func(a, b int) bool {
+		return records[a].less(&records[b])
+	})
+
+	for j := 0; j < len(records); {
+		// Gather the contiguous run of records for one address key.
+		addrKey := records[j].addrKey
+		k := j
+		for k < len(records) && records[k].addrKey == addrKey {
+			k++
+		}
+
+		// Seed the replay with the level values the address already has,
+		// counting the entries beyond the base so they can be stripped.
+		memBucket.reset()
+		existingLevels := existing[addrKey]
+		numStale := 0
+		for level, value := range existingLevels {
+			levelKey := keyForLevel(addrKey, uint8(level))
+			if err := memBucket.Put(levelKey[:], value); err != nil {
+				return err
+			}
+			for off := 0; off+txEntrySize <= len(value); off += txEntrySize {
+				if byteOrder.Uint32(value[off:]) > baseBlockID {
+					numStale++
+				}
+			}
+		}
+		if numStale > 0 {
+			err := dbRemoveAddrIndexEntries(memBucket, addrKey, numStale)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Reconstruct the on-disk level layout by replaying the entries in
+		// order through the same routine the incremental path uses.
+		var (
+			havePrev    bool
+			prevBlockID uint32
+			prevTxStart uint32
+		)
+		for _, r := range records[j:k] {
+			// Skip exact-duplicate entries.  A legitimate entry for an address
+			// is unique per block and transaction, so identical (blockID,
+			// txStart) records only arise when a resumed build re-scans heights
+			// whose records were spilled but not yet checkpointed.
+			if havePrev && r.blockID == prevBlockID && r.txStart == prevTxStart {
+				continue
+			}
+			havePrev = true
+			prevBlockID = r.blockID
+			prevTxStart = r.txStart
+
+			txLoc := wire.TxLoc{
+				TxStart: int(r.txStart),
+				TxLen:   int(r.txLen),
+			}
+			err := dbPutAddrIndexEntry(memBucket, addrKey, r.blockID, txLoc)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Emit the produced level keys in ascending level order.  There are no
+		// gaps, so the first missing level ends the address.  Seeded levels
+		// whose value did not change are already in the database and are
+		// skipped.
+		numLevels := 0
+		for level := uint8(0); ; level++ {
+			levelKey := keyForLevel(addrKey, level)
+			value := memBucket.levels[levelKey]
+			if value == nil {
+				break
+			}
+			numLevels++
+			if int(level) < len(existingLevels) &&
+				bytes.Equal(value, existingLevels[level]) {
+				continue
+			}
+			if err := emit(levelKey, value); err != nil {
+				return err
+			}
+		}
+
+		// Any seeded level beyond the ones produced no longer exists, so emit
+		// a nil value for it to have the caller delete it.
+		for level := numLevels; level < len(existingLevels); level++ {
+			levelKey := keyForLevel(addrKey, uint8(level))
+			if err := emit(levelKey, nil); err != nil {
+				return err
+			}
+		}
+
+		if addrDone != nil {
+			if err := addrDone(); err != nil {
+				return err
+			}
+		}
+		j = k
+	}
+	return nil
+}
+
+// fetchExistingAddrLevels returns the level values every address appearing in
+// the records already has in the address index bucket, in ascending level
+// order.  Addresses with no levels are absent from the returned map.
+func fetchExistingAddrLevels(db database.DB,
+	records []addrRecord) (map[[addrKeySize]byte][][]byte, error) {
+
+	addrKeys := make(map[[addrKeySize]byte]struct{})
+	for i := range records {
+		addrKeys[records[i].addrKey] = struct{}{}
+	}
+
+	existing := make(map[[addrKeySize]byte][][]byte)
+	err := db.View(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(addrIndexKey)
+		for addrKey := range addrKeys {
+			// Levels have no gaps, so the first missing level ends the
+			// address.  The values are copied since they are only valid for
+			// the duration of the transaction.
+			var levels [][]byte
+			for level := uint8(0); ; level++ {
+				levelKey := keyForLevel(addrKey, level)
+				value := bucket.Get(levelKey[:])
+				if value == nil {
+					break
+				}
+				levels = append(levels, append([]byte(nil), value...))
+			}
+			if levels != nil {
+				existing[addrKey] = levels
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
+// writeAddrIndexToDB sorts each shard, groups its records by address key, and
+// writes each address's level entries into the address index bucket in batched
+// transactions.  Shards are processed in order and each shard is sorted, so the
+// database receives keys in mostly ascending order.  baseBlockID is the block
+// id of the index tip the build extends, or zero for a build from scratch, and
+// a nonzero value has each address's staged entries merged into the level
+// values it already has.
+func (idx *AddrIndex) writeAddrIndexToDB(db database.DB, spiller *addrSpiller,
+	baseBlockID uint32, interrupt <-chan struct{}) error {
+
+	for i := range spiller.shards {
+		if err := spiller.shards[i].buf.Flush(); err != nil {
+			return err
+		}
+	}
+
+	type levelEntry struct {
+		key   [levelKeySize]byte
+		value []byte
+	}
+	batch := make([]levelEntry, 0, 4096)
+	deletes := make([][levelKeySize]byte, 0)
+	var batchBytes int
+	flush := func() error {
+		if len(batch) == 0 && len(deletes) == 0 {
+			return nil
+		}
+		err := db.Update(func(dbTx database.Tx) error {
+			bucket := dbTx.Metadata().Bucket(addrIndexKey)
+			for j := range batch {
+				err := bucket.Put(batch[j].key[:], batch[j].value)
+				if err != nil {
+					return err
+				}
+			}
+			// Merging into existing levels can leave an address with fewer
+			// levels than it had, so remove the level keys that no longer
+			// exist.
+			for j := range deletes {
+				if err := bucket.Delete(deletes[j][:]); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		batch = batch[:0]
+		deletes = deletes[:0]
+		batchBytes = 0
+		return err
+	}
+
+	memBucket := &memAddrBucket{levels: make(map[[levelKeySize]byte][]byte)}
+	for i := range spiller.shards {
+		if interruptRequested(interrupt) {
+			return errInterruptRequested
+		}
+
+		records, err := readAddrSpillShard(spiller.shards[i].f)
+		if err != nil {
+			return err
+		}
+
+		// When the build extends an existing index, load the level values the
+		// shard's addresses already have so the staged entries merge into
+		// them.  Addresses never span shards, so the levels a prior shard's
+		// flush may still have pending are not read here.
+		var existing map[[addrKeySize]byte][][]byte
+		if baseBlockID > 0 {
+			existing, err = fetchExistingAddrLevels(db, records)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = emitAddrLevelEntries(records, existing, baseBlockID, memBucket,
+			func(key [levelKeySize]byte, value []byte) error {
+				if value == nil {
+					deletes = append(deletes, key)
+					return nil
+				}
+				batch = append(batch, levelEntry{key: key, value: value})
+				batchBytes += len(value) + levelKeySize
+				return nil
+			},
+			func() error {
+				if batchBytes >= addrBuildWriteBatchBytes {
+					return flush()
+				}
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+	}
+	return flush()
 }
