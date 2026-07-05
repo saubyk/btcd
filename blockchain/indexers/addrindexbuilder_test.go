@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/database"
+	_ "github.com/btcsuite/btcd/database/ffldb"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -449,6 +451,85 @@ func TestAddrIndexFastBuildMergeDeletesExtraLevels(t *testing.T) {
 		t.Fatal("no level keys were emitted for deletion")
 	}
 	assertLevelsEqual(t, got.levels, reference.levels)
+}
+
+// TestAddrIndexRemoveEntriesAboveBlockID ensures stripping the entries beyond
+// a block id from the address index bucket restores every address to exactly
+// the entries the block id covers, removing addresses that end up with none.
+func TestAddrIndexRemoveEntriesAboveBlockID(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Create("ffldb", filepath.Join(t.TempDir(), "db"),
+		wire.MainNet)
+	if err != nil {
+		t.Fatalf("database.Create: %v", err)
+	}
+	defer db.Close()
+
+	idx := NewAddrIndex(db, nil)
+	err = db.Update(func(dbTx database.Tx) error {
+		return idx.Create(dbTx)
+	})
+	if err != nil {
+		t.Fatalf("create address index bucket: %v", err)
+	}
+
+	// entryLoc assigns three entries per block id, so the first numCovered
+	// entries have block ids at most maxBlockID.
+	const maxBlockID = 5
+	const numCovered = (maxBlockID + 1) * 3
+
+	// One address extends well past the block id, one is fully covered by it,
+	// and one has entries only beyond it and must disappear entirely.
+	var extends, covered, allStale [addrKeySize]byte
+	extends[1], extends[2] = 1, 1
+	covered[1], covered[2] = 1, 2
+	allStale[1], allStale[2] = 200, 3
+
+	ranges := map[[addrKeySize]byte]struct{ from, to int }{
+		extends:  {0, numCovered + level0MaxEntries*4 + 1},
+		covered:  {0, numCovered},
+		allStale: {numCovered, numCovered + 30},
+	}
+
+	reference := &addrIndexBucket{levels: make(map[[levelKeySize]byte][]byte)}
+	err = db.Update(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(addrIndexKey)
+		for addrKey, r := range ranges {
+			insertAddrEntries(t, bucket, addrKey, r.from, r.to)
+
+			refTo := r.to
+			if refTo > numCovered {
+				refTo = numCovered
+			}
+			insertAddrEntries(t, reference, addrKey, r.from, refTo)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("populate address index bucket: %v", err)
+	}
+
+	err = idx.removeAddrIndexEntriesAboveBlockID(maxBlockID, nil)
+	if err != nil {
+		t.Fatalf("removeAddrIndexEntriesAboveBlockID: %v", err)
+	}
+
+	got := make(map[[levelKeySize]byte][]byte)
+	err = db.View(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(addrIndexKey)
+		return bucket.ForEach(func(k, v []byte) error {
+			var levelKey [levelKeySize]byte
+			copy(levelKey[:], k)
+			got[levelKey] = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("read back address index bucket: %v", err)
+	}
+
+	assertLevelsEqual(t, got, reference.levels)
 }
 
 // TestAddrSpillRoundTrip ensures records survive a spill to the staging shards
