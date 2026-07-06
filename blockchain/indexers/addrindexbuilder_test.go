@@ -131,6 +131,37 @@ func TestAddrIndexFastBuildParity(t *testing.T) {
 	}
 }
 
+// TestAddrLevelEntryCounts ensures direct level construction uses the same
+// level occupancy as incremental insertion across level rollover boundaries.
+func TestAddrLevelEntryCounts(t *testing.T) {
+	t.Parallel()
+
+	var addrKey [addrKeySize]byte
+	bucket := &addrIndexBucket{levels: make(map[[levelKeySize]byte][]byte)}
+	for numEntries := 0; numEntries <= 10000; numEntries++ {
+		if numEntries > 0 {
+			blockID, txLoc := entryLoc(numEntries - 1)
+			if err := dbPutAddrIndexEntry(bucket, addrKey, blockID, txLoc); err != nil {
+				t.Fatalf("dbPutAddrIndexEntry: %v", err)
+			}
+		}
+
+		got := addrLevelEntryCounts(numEntries)
+		if len(got) != len(bucket.levels) {
+			t.Fatalf("%d entries: got %d levels, want %d", numEntries,
+				len(got), len(bucket.levels))
+		}
+		for level, gotEntries := range got {
+			key := keyForLevel(addrKey, uint8(level))
+			wantEntries := len(bucket.levels[key]) / txEntrySize
+			if gotEntries != wantEntries {
+				t.Fatalf("%d entries: level %d has %d entries, want %d",
+					numEntries, level, gotEntries, wantEntries)
+			}
+		}
+	}
+}
+
 // TestAddrIndexFastBuildDedupsResumeOverlap ensures that duplicate records,
 // which a resumed build produces when it re-scans heights whose records were
 // spilled but not checkpointed, do not change the built index.  The output must

@@ -1032,9 +1032,21 @@ func (idx *AddrIndex) FastBuild(chain *blockchain.BlockChain,
 	}
 
 	// Entries the build wrote beyond the previous tip are only stripped or
-	// replayed while the staging is on disk, so the tip is written before
-	// the staging is removed.
-	//
+	// replayed while the staging is on disk, so the tip write must be durable
+	// before the staging is removed.  The bulk put path flushes the database
+	// cache the transaction above wrote to and then writes straight to the
+	// backing store.
+	if putter, ok := idx.db.(database.BucketKeyPutter); ok {
+		err := putter.PutBucketKeys([][]byte{indexTipsBucketName},
+			[]database.BucketKeyValue{{
+				Key:   addrIndexKey,
+				Value: serializeIndexerTip(&builtHash, builtHeight),
+			}})
+		if err != nil {
+			return err
+		}
+	}
+
 	// Remove the whole build directory rather than just the staging inside
 	// it, so a completed build leaves nothing behind in the data dir.
 	return os.RemoveAll(filepath.Join(idx.dataDir, addrIndexBuildDirName))

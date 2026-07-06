@@ -1870,12 +1870,79 @@ type db struct {
 // Enforce db implements the database.DB interface.
 var _ database.DB = (*db)(nil)
 
+// Enforce db implements the optional database.BucketKeyPutter interface.
+var _ database.BucketKeyPutter = (*db)(nil)
+
 // Type returns the database driver type the current database instance was
 // created with.
 //
 // This function is part of the database.DB interface implementation.
 func (db *db) Type() string {
 	return dbType
+}
+
+// PutBucketKeys writes the entries into the bucket named by bucketPath.  Each
+// bucketPath element names one nested bucket from the metadata root.
+//
+// This function is part of the optional database.BucketKeyPutter interface
+// implementation.
+func (db *db) PutBucketKeys(bucketPath [][]byte, entries []database.BucketKeyValue) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	tx, err := db.begin(true)
+	if err != nil {
+		return err
+	}
+	defer rollbackOnPanic(tx)
+
+	targetBucket := tx.metaBucket
+	for _, bucketName := range bucketPath {
+		childBucket := targetBucket.Bucket(bucketName)
+		if childBucket == nil {
+			_ = tx.Rollback()
+			str := fmt.Sprintf("bucket %q does not exist", bucketName)
+			return makeDbErr(database.ErrBucketNotFound, str, nil)
+		}
+		targetBucket = childBucket.(*bucket)
+	}
+
+	for _, entry := range entries {
+		if len(entry.Key) == 0 {
+			_ = tx.Rollback()
+			str := "put requires a key"
+			return makeDbErr(database.ErrKeyRequired, str, nil)
+		}
+	}
+
+	// Direct LevelDB writes must not be shadowed by older cached metadata
+	// entries.  Flush any pending cache state once before bypassing it.
+	if db.cache.hasEntries() {
+		if err := db.cache.flush(); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	bucketID := targetBucket.id
+	err = db.cache.updateDB(func(ldbTx *leveldb.Transaction) error {
+		for _, entry := range entries {
+			key := bucketizedKey(bucketID, entry.Key)
+			if dbErr := ldbTx.Put(key, entry.Value, nil); dbErr != nil {
+				str := fmt.Sprintf("failed to put key %q to "+
+					"ldb transaction", key)
+				return convertErr(str, dbErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Rollback()
 }
 
 // begin is the implementation function for the Begin database method.  See its

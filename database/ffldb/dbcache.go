@@ -532,6 +532,15 @@ func (c *dbCache) flush() error {
 	return nil
 }
 
+// hasEntries returns whether there are any cached metadata changes waiting to
+// be flushed to the underlying database.
+func (c *dbCache) hasEntries() bool {
+	c.cacheLock.RLock()
+	hasEntries := c.cachedKeys.Len() != 0 || c.cachedRemove.Len() != 0
+	c.cacheLock.RUnlock()
+	return hasEntries
+}
+
 // needsFlush returns whether or not the database cache needs to be flushed to
 // persistent storage based on its current size, whether or not adding all of
 // the entries in the passed database transaction would cause it to exceed the
