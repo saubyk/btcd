@@ -484,3 +484,19 @@ type DB interface {
 	// back or committed).
 	Close() error
 }
+
+// BucketKeyValue describes one key/value pair to write into a bucket.
+type BucketKeyValue struct {
+	Key   []byte
+	Value []byte
+}
+
+// BucketKeyPutter is an optional interface a database backend may implement to
+// efficiently write key/value pairs into a bucket in batches.
+//
+// PutBucketKeys writes the entries into the bucket named by bucketPath, where
+// each element is one nested bucket name from the metadata root.  The backend
+// must not retain the entry slices after PutBucketKeys returns.
+type BucketKeyPutter interface {
+	PutBucketKeys(bucketPath [][]byte, entries []BucketKeyValue) error
+}

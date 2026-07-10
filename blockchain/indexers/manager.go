@@ -54,15 +54,20 @@ const (
 //   block height    uint32           4 bytes
 // -----------------------------------------------------------------------------
 
-// dbPutIndexerTip uses an existing database transaction to update or add the
-// current tip for the given index to the provided values.
-func dbPutIndexerTip(dbTx database.Tx, idxKey []byte, hash *chainhash.Hash, height int32) error {
+// serializeIndexerTip returns the serialized index tip entry for the provided
+// block hash and height.
+func serializeIndexerTip(hash *chainhash.Hash, height int32) []byte {
 	serialized := make([]byte, chainhash.HashSize+4)
 	copy(serialized, hash[:])
 	byteOrder.PutUint32(serialized[chainhash.HashSize:], uint32(height))
+	return serialized
+}
 
+// dbPutIndexerTip uses an existing database transaction to update or add the
+// current tip for the given index to the provided values.
+func dbPutIndexerTip(dbTx database.Tx, idxKey []byte, hash *chainhash.Hash, height int32) error {
 	indexesBucket := dbTx.Metadata().Bucket(indexTipsBucketName)
-	return indexesBucket.Put(idxKey, serialized)
+	return indexesBucket.Put(idxKey, serializeIndexerTip(hash, height))
 }
 
 // dbFetchIndexerTip uses an existing database transaction to retrieve the
@@ -453,6 +458,46 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 	})
 	if err != nil {
 		return err
+	}
+
+	// Bulk-build any index that supports a fast build and is behind the best
+	// chain tip.  The builder extends whatever data the index already has, and
+	// may also decide a bulk build is not worthwhile for the remaining gap and
+	// return without building anything, leaving the catchup to the per-block
+	// loop below.
+	for i, indexer := range m.enabledIndexes {
+		builder, ok := indexer.(FastBuilder)
+		if !ok || indexerHeights[i] >= bestHeight {
+			continue
+		}
+		if err := builder.FastBuild(chain, interrupt); err != nil {
+			return err
+		}
+
+		// Reflect the tip the fast build persisted rather than assuming it
+		// reached bestHeight.  The per-block loop below then connects any
+		// blocks that arrived after the build read its target height.
+		var height int32
+		err = m.db.View(func(dbTx database.Tx) error {
+			_, height, err = dbFetchIndexerTip(dbTx, indexer.Key())
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		indexerHeights[i] = height
+	}
+
+	// Recompute the lowest height from the now-updated indexerHeights.  A fast
+	// build advances its index's on-disk tip without touching lowestHeight
+	// above, so leaving it stale would send the per-block catchup loop below
+	// through every height the fast build already covered instead of jumping
+	// straight to the remaining gap.
+	lowestHeight = bestHeight
+	for _, height := range indexerHeights {
+		if height < lowestHeight {
+			lowestHeight = height
+		}
 	}
 
 	// Nothing to index if all of the indexes are caught up.

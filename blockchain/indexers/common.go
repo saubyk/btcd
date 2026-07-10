@@ -45,6 +45,18 @@ type BatchIndexer interface {
 		[][]blockchain.SpentTxOut) error
 }
 
+// FastBuilder is an optional interface an indexer may implement to bulk-build
+// itself directly from the chain instead of being driven through the manager's
+// block-by-block catchup loop.  The manager invokes FastBuild for an
+// implementing index that is behind the best chain tip, whether it has no data
+// yet or is partially built, and reads the index tip back once it returns to
+// catch up any remaining blocks block by block.  FastBuild is responsible for
+// persisting the tip of whatever it builds, and may return without building
+// anything when a bulk build is not worthwhile.
+type FastBuilder interface {
+	FastBuild(chain *blockchain.BlockChain, interrupt <-chan struct{}) error
+}
+
 // Indexer provides a generic interface for an indexer that is managed by an
 // index manager such as the Manager type provided by this package.
 type Indexer interface {
