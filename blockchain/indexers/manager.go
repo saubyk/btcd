@@ -21,6 +21,20 @@ var (
 	indexTipsBucketName = []byte("idxtips")
 )
 
+const (
+	// catchupMaxBatchBlocks is the maximum number of blocks that are
+	// connected to the indexes in a single database transaction during
+	// index catchup.
+	catchupMaxBatchBlocks = 2000
+
+	// catchupMaxBatchBytes is the maximum cumulative serialized size of
+	// blocks that are connected to the indexes in a single database
+	// transaction during index catchup.  It bounds the memory held for
+	// pending blocks as well as the size of the resulting database
+	// transaction.
+	catchupMaxBatchBytes = 32 * 1024 * 1024
+)
+
 // -----------------------------------------------------------------------------
 // The index manager tracks the current tip of each index by using a parent
 // bucket that contains an entry for index.
@@ -92,6 +106,44 @@ func dbIndexConnectBlock(dbTx database.Tx, indexer Indexer, block *btcutil.Block
 
 	// Update the current index tip.
 	return dbPutIndexerTip(dbTx, idxKey, block.Hash(), block.Height())
+}
+
+// dbIndexConnectBlocks adds all of the index entries associated with the
+// given consecutive blocks using the provided indexer and updates the tip of
+// the indexer to the last block.  The stxos slice must contain the spent
+// txout journal for each block at the matching position.  An error will be
+// returned if the current tip for the indexer is not the previous block for
+// the first passed block.
+func dbIndexConnectBlocks(dbTx database.Tx, indexer Indexer,
+	blocks []*btcutil.Block, stxos [][]blockchain.SpentTxOut) error {
+
+	// Assert that the first block being connected properly extends the
+	// current tip of the index.
+	idxKey := indexer.Key()
+	curTipHash, _, err := dbFetchIndexerTip(dbTx, idxKey)
+	if err != nil {
+		return err
+	}
+	if !curTipHash.IsEqual(&blocks[0].MsgBlock().Header.PrevBlock) {
+		return AssertError(fmt.Sprintf("dbIndexConnectBlocks must be "+
+			"called with a block that extends the current index "+
+			"tip (%s, tip %s, block %s)", indexer.Name(),
+			curTipHash, blocks[0].Hash()))
+	}
+
+	// Notify the indexer with all of the connected blocks so it can index
+	// them.
+	for i, block := range blocks {
+		err := indexer.ConnectBlock(dbTx, block, stxos[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	// Update the current index tip.
+	lastBlock := blocks[len(blocks)-1]
+	return dbPutIndexerTip(dbTx, idxKey, lastBlock.Hash(),
+		lastBlock.Height())
 }
 
 // dbIndexDisconnectBlock removes all of the index entries associated with the
@@ -399,53 +451,113 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 
 	// At this point, one or more indexes are behind the current best chain
 	// tip and need to be caught up, so log the details and loop through
-	// each block that needs to be indexed.
+	// each block that needs to be indexed.  Blocks are connected in
+	// batches within a single database transaction in order to amortize
+	// the transaction overhead and allow writes for the same keys to be
+	// coalesced.
 	log.Infof("Catching up indexes from height %d to %d", lowestHeight,
 		bestHeight)
-	for height := lowestHeight + 1; height <= bestHeight; height++ {
-		// Load the block for the height since it is required to index
-		// it.
-		block, err := chain.BlockByHeight(height)
-		if err != nil {
-			return err
-		}
-
-		if interruptRequested(interrupt) {
-			return errInterruptRequested
-		}
-
-		// Connect the block for all indexes that need it.
-		var spentTxos []blockchain.SpentTxOut
+	for height := lowestHeight + 1; height <= bestHeight; {
+		// Determine the lowest height for which an index requires the
+		// referenced inputs so the spend journal is only loaded for
+		// blocks that need it.
+		inputsHeight := bestHeight + 1
 		for i, indexer := range m.enabledIndexes {
-			// Skip indexes that don't need to be updated with this
-			// block.
-			if indexerHeights[i] >= height {
+			if !indexNeedsInputs(indexer) {
 				continue
 			}
+			if indexerHeights[i]+1 < inputsHeight {
+				inputsHeight = indexerHeights[i] + 1
+			}
+		}
 
-			// When the index requires all of the referenced txouts
-			// and they haven't been loaded yet, they need to be
+		// Gather the next batch of blocks along with their spend
+		// journals until one of the batch limits is reached.
+		batchStart := height
+		var (
+			batchBlocks []*btcutil.Block
+			batchStxos  [][]blockchain.SpentTxOut
+			batchBytes  int
+		)
+		for height <= bestHeight &&
+			len(batchBlocks) < catchupMaxBatchBlocks &&
+			batchBytes < catchupMaxBatchBytes {
+
+			// Load the block for the height since it is required
+			// to index it.
+			block, err := chain.BlockByHeight(height)
+			if err != nil {
+				return err
+			}
+			serializedBlock, err := block.Bytes()
+			if err != nil {
+				return err
+			}
+
+			// When one or more of the indexes requires all of the
+			// referenced txouts for this block, they need to be
 			// retrieved from the spend journal.
-			if spentTxos == nil && indexNeedsInputs(indexer) {
+			var spentTxos []blockchain.SpentTxOut
+			if height >= inputsHeight {
 				spentTxos, err = chain.FetchSpendJournal(block)
 				if err != nil {
 					return err
 				}
 			}
 
-			err := m.db.Update(func(dbTx database.Tx) error {
-				return dbIndexConnectBlock(
-					dbTx, indexer, block, spentTxos,
-				)
-			})
-			if err != nil {
-				return err
+			batchBlocks = append(batchBlocks, block)
+			batchStxos = append(batchStxos, spentTxos)
+			batchBytes += len(serializedBlock)
+			height++
+
+			if interruptRequested(interrupt) {
+				return errInterruptRequested
 			}
-			indexerHeights[i] = height
+		}
+
+		// Connect the batch of blocks to all indexes that need them
+		// within a single database transaction.
+		err = m.db.Update(func(dbTx database.Tx) error {
+			for i, indexer := range m.enabledIndexes {
+				// Skip any leading blocks the index already
+				// has.  Index tips can only be at previously
+				// committed batch boundaries, so an index that
+				// is not caught up needs the remainder of the
+				// batch.
+				startIdx := 0
+				if indexerHeights[i] >= batchStart {
+					startIdx = int(indexerHeights[i]-
+						batchStart) + 1
+				}
+				if startIdx >= len(batchBlocks) {
+					continue
+				}
+
+				err := dbIndexConnectBlocks(dbTx, indexer,
+					batchBlocks[startIdx:],
+					batchStxos[startIdx:])
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		// All indexes are now caught up to the last block in the
+		// batch.
+		for i := range indexerHeights {
+			if indexerHeights[i] < height-1 {
+				indexerHeights[i] = height - 1
+			}
 		}
 
 		// Log indexing progress.
-		progressLogger.LogBlockHeight(block)
+		for _, block := range batchBlocks {
+			progressLogger.LogBlockHeight(block)
+		}
 
 		if interruptRequested(interrupt) {
 			return errInterruptRequested
