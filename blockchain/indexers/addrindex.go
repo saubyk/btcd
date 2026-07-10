@@ -259,6 +259,110 @@ func dbPutAddrIndexEntry(bucket internalBucket, addrKey [addrKeySize]byte,
 	return bucket.Put(level0Key[:], newData)
 }
 
+// dbPutAddrIndexEntries updates the address index to include the provided
+// serialized entries, which must consist of one or more entries serialized by
+// serializeAddrIndexEntry concatenated in chain order.  The resulting database
+// state is identical to calling dbPutAddrIndexEntry for each entry in order,
+// however all reads and writes for the address are performed once per touched
+// level rather than once per entry which significantly reduces the database
+// overhead when connecting many entries at once.
+func dbPutAddrIndexEntries(bucket internalBucket, addrKey [addrKeySize]byte,
+	entries []byte) error {
+
+	if len(entries)%txEntrySize != 0 {
+		return AssertError(fmt.Sprintf("dbPutAddrIndexEntries called "+
+			"with misaligned entry data length %d", len(entries)))
+	}
+
+	// Track the data for each touched level in memory and only apply the
+	// final result to the database once all entries have been merged.  The
+	// data for each level is lazily loaded on first access and a level is
+	// only written back when it was modified.
+	levels := make(map[uint8][]byte)
+	dirty := make(map[uint8]struct{})
+	getLevel := func(level uint8) []byte {
+		if data, ok := levels[level]; ok {
+			return data
+		}
+		curLevelKey := keyForLevel(addrKey, level)
+		data := bucket.Get(curLevelKey[:])
+		levels[level] = data
+		return data
+	}
+	setLevel := func(level uint8, data []byte) {
+		levels[level] = data
+		dirty[level] = struct{}{}
+	}
+
+	maxLevel0Bytes := level0MaxEntries * txEntrySize
+	for len(entries) > 0 {
+		// Append as many entries to level 0 as it can hold.  This is
+		// the most common path.
+		level0Data := getLevel(0)
+		if len(level0Data) < maxLevel0Bytes {
+			numBytes := maxLevel0Bytes - len(level0Data)
+			if numBytes > len(entries) {
+				numBytes = len(entries)
+			}
+			merged := make([]byte, len(level0Data)+numBytes)
+			copy(merged, level0Data)
+			copy(merged[len(level0Data):], entries[:numBytes])
+			setLevel(0, merged)
+			entries = entries[numBytes:]
+			continue
+		}
+
+		// At this point, level 0 is full and more entries remain, so
+		// merge each level into higher levels as many times as needed
+		// to free up level 0 using the same scheme as
+		// dbPutAddrIndexEntry, except against the in-memory level data.
+		prevLevelData := level0Data
+		curLevel := uint8(1)
+		maxLevelBytes := maxLevel0Bytes * 2
+		for {
+			// Move to the next level as long as the current level
+			// is full.
+			curLevelData := getLevel(curLevel)
+			if len(curLevelData) == maxLevelBytes {
+				prevLevelData = curLevelData
+				curLevel++
+				maxLevelBytes *= 2
+				continue
+			}
+
+			// The current level has room for the data in the
+			// previous one, so merge the data from the previous
+			// level into it.
+			merged := make([]byte, len(curLevelData)+
+				len(prevLevelData))
+			copy(merged, curLevelData)
+			copy(merged[len(curLevelData):], prevLevelData)
+			setLevel(curLevel, merged)
+
+			// Move all of the levels before the previous one up a
+			// level and clear level 0 so the next iteration of the
+			// outer loop refills it with the remaining entries.
+			for mergeLevel := curLevel - 1; mergeLevel > 0; mergeLevel-- {
+				setLevel(mergeLevel, getLevel(mergeLevel-1))
+			}
+			setLevel(0, nil)
+			break
+		}
+	}
+
+	// Apply the modified levels to the database.  Level 0 is guaranteed to
+	// be non-empty here since the loop above always terminates by filling
+	// it with remaining entries and merges only move data to non-empty
+	// higher levels.
+	for level := range dirty {
+		curLevelKey := keyForLevel(addrKey, level)
+		if err := bucket.Put(curLevelKey[:], levels[level]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // dbFetchAddrIndexEntries returns block regions for transactions referenced by
 // the given address key and the number of entries skipped since it could have
 // been less in the case where there are less total entries than the requested

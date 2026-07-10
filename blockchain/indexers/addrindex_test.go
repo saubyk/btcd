@@ -163,6 +163,90 @@ func (b *addrIndexBucket) sanityCheck(addrKey [addrKeySize]byte, expectedTotal i
 	return nil
 }
 
+// TestAddrIndexMultiEntryPut ensures that dbPutAddrIndexEntries produces a
+// bucket that is byte-identical to sequentially calling dbPutAddrIndexEntry
+// for each entry across a variety of pre-existing index states and batch
+// sizes.
+func TestAddrIndexMultiEntryPut(t *testing.T) {
+	t.Parallel()
+
+	// equalBuckets returns an error when the two mock buckets do not
+	// contain identical level data.
+	equalBuckets := func(a, b *addrIndexBucket) error {
+		for k, av := range a.levels {
+			if !bytes.Equal(av, b.levels[k]) {
+				return fmt.Errorf("mismatched data for level "+
+					"key %x: %x != %x", k, av, b.levels[k])
+			}
+		}
+		for k := range b.levels {
+			if _, ok := a.levels[k]; !ok {
+				return fmt.Errorf("extra level key %x", k)
+			}
+		}
+		return nil
+	}
+
+	var key [addrKeySize]byte
+	for numExisting := 0; numExisting <= 60; numExisting++ {
+		// Create a bucket populated with the pre-existing entries via
+		// sequential puts.
+		populated := &addrIndexBucket{
+			levels: make(map[[levelKeySize]byte][]byte),
+		}
+		for i := 0; i < numExisting; i++ {
+			txLoc := wire.TxLoc{TxStart: i * 2}
+			err := dbPutAddrIndexEntry(populated, key, uint32(i),
+				txLoc)
+			if err != nil {
+				t.Fatalf("dbPutAddrIndexEntry: unexpected "+
+					"error: %v", err)
+			}
+		}
+
+		for numBatch := 1; numBatch <= 100; numBatch++ {
+			seqBucket := populated.Clone()
+			batchBucket := populated.Clone()
+
+			// Add the new entries to one bucket sequentially and to
+			// the other via a single multi-entry put.
+			var entries []byte
+			for i := numExisting; i < numExisting+numBatch; i++ {
+				txLoc := wire.TxLoc{TxStart: i * 2}
+				err := dbPutAddrIndexEntry(seqBucket, key,
+					uint32(i), txLoc)
+				if err != nil {
+					t.Fatalf("dbPutAddrIndexEntry: "+
+						"unexpected error: %v", err)
+				}
+				entries = append(entries,
+					serializeAddrIndexEntry(uint32(i),
+						txLoc)...)
+			}
+			err := dbPutAddrIndexEntries(batchBucket, key, entries)
+			if err != nil {
+				t.Fatalf("dbPutAddrIndexEntries (existing %d, "+
+					"batch %d): unexpected error: %v",
+					numExisting, numBatch, err)
+			}
+
+			// Both buckets must be byte-identical and adhere to the
+			// level rules.
+			if err := equalBuckets(seqBucket, batchBucket); err != nil {
+				t.Fatalf("bucket mismatch (existing %d, batch "+
+					"%d): %v", numExisting, numBatch, err)
+			}
+			err = batchBucket.sanityCheck(key,
+				numExisting+numBatch)
+			if err != nil {
+				t.Fatalf("sanity check fail (existing %d, "+
+					"batch %d): %v", numExisting, numBatch,
+					err)
+			}
+		}
+	}
+}
+
 // TestAddrIndexLevels ensures that adding and deleting entries to the address
 // index creates multiple levels as described by the address index
 // documentation.
