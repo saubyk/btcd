@@ -20,8 +20,13 @@ import (
 )
 
 const (
-	// defaultCacheSize is the default size for the database cache.
-	defaultCacheSize = 100 * 1024 * 1024 // 100 MB
+	// defaultCacheSize is the default size for the database cache.  Writes
+	// are buffered in the cache until it fills or the flush interval is
+	// reached and reads check it before hitting the underlying database,
+	// so a larger cache substantially reduces the number of random point
+	// reads that reach leveldb for read-modify-write heavy workloads such
+	// as building the address index.
+	defaultCacheSize = 512 * 1024 * 1024 // 512 MB
 
 	// defaultFlushSecs is the default number of seconds to use as a
 	// threshold in between database cache flushes when the cache size has

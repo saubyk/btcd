@@ -2133,11 +2133,21 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 	}
 
 	// Open the metadata database (will create it if needed).
+	//
+	// The block cache and write buffer are raised well above the leveldb
+	// defaults (8 MiB and 4 MiB respectively) since the metadata database
+	// houses the optional indexes whose keys are uniformly distributed
+	// hashes.  Point reads against them are effectively random, so serving
+	// table blocks from memory instead of storage dominates index build
+	// performance.  A larger write buffer additionally reduces write
+	// amplification by producing fewer, larger level 0 tables.
 	opts := opt.Options{
-		ErrorIfExist: create,
-		Strict:       opt.DefaultStrict,
-		Compression:  opt.NoCompression,
-		Filter:       filter.NewBloomFilter(10),
+		ErrorIfExist:       create,
+		Strict:             opt.DefaultStrict,
+		Compression:        opt.NoCompression,
+		Filter:             filter.NewBloomFilter(10),
+		BlockCacheCapacity: 512 * opt.MiB,
+		WriteBuffer:        64 * opt.MiB,
 	}
 	ldb, err := leveldb.OpenFile(metadataDbPath, &opts)
 	if err != nil {
