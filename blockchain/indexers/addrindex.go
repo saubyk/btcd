@@ -5,8 +5,10 @@
 package indexers
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -948,10 +950,22 @@ func (idx *AddrIndex) ConnectBlocks(dbTx database.Tx,
 		}
 	}
 
-	// Apply the accumulated entries with a single update per address.
+	// Apply the accumulated entries with a single update per address.  The
+	// addresses are applied in sorted key order so the reads performed by
+	// the updates walk the backing store sequentially, which gives far
+	// better table block cache locality than the random probing that
+	// iterating the map directly would produce.
+	sortedKeys := make([][addrKeySize]byte, 0, len(addrsToEntries))
+	for addrKey := range addrsToEntries {
+		sortedKeys = append(sortedKeys, addrKey)
+	}
+	sort.Slice(sortedKeys, func(i, j int) bool {
+		return bytes.Compare(sortedKeys[i][:], sortedKeys[j][:]) < 0
+	})
 	addrIdxBucket := dbTx.Metadata().Bucket(addrIndexKey)
-	for addrKey, entries := range addrsToEntries {
-		err := dbPutAddrIndexEntries(addrIdxBucket, addrKey, entries)
+	for _, addrKey := range sortedKeys {
+		err := dbPutAddrIndexEntries(addrIdxBucket, addrKey,
+			addrsToEntries[addrKey])
 		if err != nil {
 			return err
 		}
