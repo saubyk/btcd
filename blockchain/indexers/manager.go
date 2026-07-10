@@ -131,12 +131,20 @@ func dbIndexConnectBlocks(dbTx database.Tx, indexer Indexer,
 			curTipHash, blocks[0].Hash()))
 	}
 
-	// Notify the indexer with all of the connected blocks so it can index
-	// them.
-	for i, block := range blocks {
-		err := indexer.ConnectBlock(dbTx, block, stxos[i])
+	// Use the batch interface when the indexer supports it and fall back
+	// to connecting the blocks individually within the same database
+	// transaction otherwise.
+	if batchIndexer, ok := indexer.(BatchIndexer); ok {
+		err := batchIndexer.ConnectBlocks(dbTx, blocks, stxos)
 		if err != nil {
 			return err
+		}
+	} else {
+		for i, block := range blocks {
+			err := indexer.ConnectBlock(dbTx, block, stxos[i])
+			if err != nil {
+				return err
+			}
 		}
 	}
 

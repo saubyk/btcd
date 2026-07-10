@@ -32,6 +32,19 @@ type NeedsInputser interface {
 	NeedsInputs() bool
 }
 
+// BatchIndexer provides an optional interface that an indexer can implement
+// to connect a batch of consecutive blocks more efficiently than repeated
+// ConnectBlock calls.  It is used during initial index catchup where many
+// blocks are connected within a single database transaction.
+type BatchIndexer interface {
+	// ConnectBlocks indexes all of the provided consecutive blocks.  The
+	// stxos slice contains the spent txout journal for each block at the
+	// matching position.  The result must be identical to invoking
+	// ConnectBlock for each block in order.
+	ConnectBlocks(database.Tx, []*btcutil.Block,
+		[][]blockchain.SpentTxOut) error
+}
+
 // Indexer provides a generic interface for an indexer that is managed by an
 // index manager such as the Manager type provided by this package.
 type Indexer interface {

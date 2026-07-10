@@ -738,6 +738,9 @@ var _ Indexer = (*AddrIndex)(nil)
 // Ensure the AddrIndex type implements the NeedsInputser interface.
 var _ NeedsInputser = (*AddrIndex)(nil)
 
+// Ensure the AddrIndex type implements the BatchIndexer interface.
+var _ BatchIndexer = (*AddrIndex)(nil)
+
 // NeedsInputs signals that the index requires the referenced inputs in order
 // to properly create the index.
 //
@@ -884,6 +887,73 @@ func (idx *AddrIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Block,
 			if err != nil {
 				return err
 			}
+		}
+	}
+
+	return nil
+}
+
+// ConnectBlocks is invoked by the index manager during initial index catchup
+// when a batch of consecutive blocks is being connected within a single
+// database transaction.  It produces the same index entries as invoking
+// ConnectBlock for each block in order, however the entries for each address
+// are accumulated across the entire batch and applied with a single update
+// per address, which avoids the per-entry read-modify-write cycle against
+// the database.  This matters because addresses that appear in many blocks
+// of the batch would otherwise trigger a random database read for every
+// transaction that involves them.
+//
+// This implements the BatchIndexer interface.
+func (idx *AddrIndex) ConnectBlocks(dbTx database.Tx,
+	blocks []*btcutil.Block, stxos [][]blockchain.SpentTxOut) error {
+
+	// Accumulate the serialized index entries for every address across
+	// the entire batch.  The blocks are processed in order, so the
+	// entries for each address are naturally in chain order.
+	addrsToEntries := make(map[[addrKeySize]byte][]byte)
+	for i, block := range blocks {
+		// The offset and length of the transactions within the
+		// serialized block.
+		txLocs, err := block.TxLoc()
+		if err != nil {
+			return err
+		}
+
+		// Get the internal block ID associated with the block.  The
+		// entry is created by the transaction index which is
+		// guaranteed to be connected for this block already since it
+		// is always enabled alongside the address index and processed
+		// before it within the same database transaction.
+		blockID, err := dbFetchBlockIDByHash(dbTx, block.Hash())
+		if err != nil {
+			return err
+		}
+
+		// Build all of the address to transaction mappings in a local
+		// map and serialize them into the accumulated entries.
+		addrsToTxns := make(writeIndexData)
+		idx.indexBlock(addrsToTxns, block, stxos[i])
+		for addrKey, txIdxs := range addrsToTxns {
+			entries := addrsToEntries[addrKey]
+			for _, txIdx := range txIdxs {
+				var entry [txEntrySize]byte
+				byteOrder.PutUint32(entry[:], blockID)
+				byteOrder.PutUint32(entry[4:],
+					uint32(txLocs[txIdx].TxStart))
+				byteOrder.PutUint32(entry[8:],
+					uint32(txLocs[txIdx].TxLen))
+				entries = append(entries, entry[:]...)
+			}
+			addrsToEntries[addrKey] = entries
+		}
+	}
+
+	// Apply the accumulated entries with a single update per address.
+	addrIdxBucket := dbTx.Metadata().Bucket(addrIndexKey)
+	for addrKey, entries := range addrsToEntries {
+		err := dbPutAddrIndexEntries(addrIdxBucket, addrKey, entries)
+		if err != nil {
+			return err
 		}
 	}
 
