@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -909,17 +910,51 @@ func (idx *AddrIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Block,
 func (idx *AddrIndex) ConnectBlocks(dbTx database.Tx,
 	blocks []*btcutil.Block, stxos [][]blockchain.SpentTxOut) error {
 
+	// Compute the transaction locations and the address to transaction
+	// mappings for all blocks in the batch concurrently since extracting
+	// the addresses from the scripts is CPU-bound and independent per
+	// block.  No database access happens in the workers.
+	type blockIndexData struct {
+		txLocs      []wire.TxLoc
+		addrsToTxns writeIndexData
+		err         error
+	}
+	indexData := make([]blockIndexData, len(blocks))
+	var wg sync.WaitGroup
+	workers := make(chan struct{}, runtime.NumCPU())
+	for i, block := range blocks {
+		wg.Add(1)
+		go func(data *blockIndexData, block *btcutil.Block,
+			stxos []blockchain.SpentTxOut) {
+
+			defer wg.Done()
+			workers <- struct{}{}
+			defer func() { <-workers }()
+
+			// The offset and length of the transactions within the
+			// serialized block.
+			data.txLocs, data.err = block.TxLoc()
+			if data.err != nil {
+				return
+			}
+
+			// Build all of the address to transaction mappings in
+			// a local map.
+			data.addrsToTxns = make(writeIndexData)
+			idx.indexBlock(data.addrsToTxns, block, stxos)
+		}(&indexData[i], block, stxos[i])
+	}
+	wg.Wait()
+
 	// Accumulate the serialized index entries for every address across
 	// the entire batch.  The blocks are processed in order, so the
 	// entries for each address are naturally in chain order.
 	addrsToEntries := make(map[[addrKeySize]byte][]byte)
 	for i, block := range blocks {
-		// The offset and length of the transactions within the
-		// serialized block.
-		txLocs, err := block.TxLoc()
-		if err != nil {
-			return err
+		if indexData[i].err != nil {
+			return indexData[i].err
 		}
+		txLocs := indexData[i].txLocs
 
 		// Get the internal block ID associated with the block.  The
 		// entry is created by the transaction index which is
@@ -931,11 +966,8 @@ func (idx *AddrIndex) ConnectBlocks(dbTx database.Tx,
 			return err
 		}
 
-		// Build all of the address to transaction mappings in a local
-		// map and serialize them into the accumulated entries.
-		addrsToTxns := make(writeIndexData)
-		idx.indexBlock(addrsToTxns, block, stxos[i])
-		for addrKey, txIdxs := range addrsToTxns {
+		// Serialize the mappings into the accumulated entries.
+		for addrKey, txIdxs := range indexData[i].addrsToTxns {
 			entries := addrsToEntries[addrKey]
 			for _, txIdx := range txIdxs {
 				var entry [txEntrySize]byte

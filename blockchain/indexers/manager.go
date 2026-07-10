@@ -33,6 +33,12 @@ const (
 	// pending blocks as well as the size of the resulting database
 	// transaction.
 	catchupMaxBatchBytes = 32 * 1024 * 1024
+
+	// catchupPrefetchDepth is the number of blocks that are loaded along
+	// with their spend journals ahead of the batch currently being
+	// connected during index catchup.  This allows the storage reads to
+	// overlap with the index writes rather than alternating with them.
+	catchupPrefetchDepth = 64
 )
 
 // -----------------------------------------------------------------------------
@@ -465,20 +471,65 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 	// coalesced.
 	log.Infof("Catching up indexes from height %d to %d", lowestHeight,
 		bestHeight)
-	for height := lowestHeight + 1; height <= bestHeight; {
-		// Determine the lowest height for which an index requires the
-		// referenced inputs so the spend journal is only loaded for
-		// blocks that need it.
-		inputsHeight := bestHeight + 1
-		for i, indexer := range m.enabledIndexes {
-			if !indexNeedsInputs(indexer) {
-				continue
+
+	// Determine the lowest height for which an index requires the
+	// referenced inputs so the spend journal is only loaded for blocks
+	// that need it.  The indexer tips only move forward during catchup,
+	// so this can be computed once up front.
+	inputsHeight := bestHeight + 1
+	for i, indexer := range m.enabledIndexes {
+		if !indexNeedsInputs(indexer) {
+			continue
+		}
+		if indexerHeights[i]+1 < inputsHeight {
+			inputsHeight = indexerHeights[i] + 1
+		}
+	}
+
+	// Start a prefetcher that loads the blocks along with their spend
+	// journals ahead of the batch currently being connected so the
+	// storage reads overlap with the index writes below.  The quit
+	// channel is closed on return which unblocks any pending send and
+	// terminates the prefetcher.
+	type prefetchedBlock struct {
+		block *btcutil.Block
+		stxos []blockchain.SpentTxOut
+		err   error
+	}
+	quit := make(chan struct{})
+	defer close(quit)
+	prefetched := make(chan prefetchedBlock, catchupPrefetchDepth)
+	go func() {
+		defer close(prefetched)
+		for height := lowestHeight + 1; height <= bestHeight; height++ {
+			// Load the block for the height since it is required
+			// to index it.
+			block, err := chain.BlockByHeight(height)
+
+			// When one or more of the indexes requires all of the
+			// referenced txouts for this block, they need to be
+			// retrieved from the spend journal.
+			var spentTxos []blockchain.SpentTxOut
+			if err == nil && height >= inputsHeight {
+				spentTxos, err = chain.FetchSpendJournal(block)
 			}
-			if indexerHeights[i]+1 < inputsHeight {
-				inputsHeight = indexerHeights[i] + 1
+
+			select {
+			case prefetched <- prefetchedBlock{
+				block: block,
+				stxos: spentTxos,
+				err:   err,
+			}:
+			case <-quit:
+				return
+			}
+			if err != nil {
+				return
 			}
 		}
+	}()
 
+	for height := lowestHeight + 1; height <= bestHeight; {
 		// Gather the next batch of blocks along with their spend
 		// journals until one of the batch limits is reached.
 		batchStart := height
@@ -491,30 +542,21 @@ func (m *Manager) Init(chain *blockchain.BlockChain, interrupt <-chan struct{}) 
 			len(batchBlocks) < catchupMaxBatchBlocks &&
 			batchBytes < catchupMaxBatchBytes {
 
-			// Load the block for the height since it is required
-			// to index it.
-			block, err := chain.BlockByHeight(height)
-			if err != nil {
-				return err
+			pb, ok := <-prefetched
+			if !ok {
+				return AssertError("index catchup block " +
+					"prefetcher terminated early")
 			}
-			serializedBlock, err := block.Bytes()
+			if pb.err != nil {
+				return pb.err
+			}
+			serializedBlock, err := pb.block.Bytes()
 			if err != nil {
 				return err
 			}
 
-			// When one or more of the indexes requires all of the
-			// referenced txouts for this block, they need to be
-			// retrieved from the spend journal.
-			var spentTxos []blockchain.SpentTxOut
-			if height >= inputsHeight {
-				spentTxos, err = chain.FetchSpendJournal(block)
-				if err != nil {
-					return err
-				}
-			}
-
-			batchBlocks = append(batchBlocks, block)
-			batchStxos = append(batchStxos, spentTxos)
+			batchBlocks = append(batchBlocks, pb.block)
+			batchStxos = append(batchStxos, pb.stxos)
 			batchBytes += len(serializedBlock)
 			height++
 
