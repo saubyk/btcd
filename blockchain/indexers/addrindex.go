@@ -872,36 +872,13 @@ func (idx *AddrIndex) indexBlock(data writeIndexData, block *btcutil.Block,
 func (idx *AddrIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Block,
 	stxos []blockchain.SpentTxOut) error {
 
-	// The offset and length of the transactions within the serialized
-	// block.
-	txLocs, err := block.TxLoc()
-	if err != nil {
-		return err
-	}
-
-	// Get the internal block ID associated with the block.
-	blockID, err := dbFetchBlockIDByHash(dbTx, block.Hash())
-	if err != nil {
-		return err
-	}
-
-	// Build all of the address to transaction mappings in a local map.
-	addrsToTxns := make(writeIndexData)
-	idx.indexBlock(addrsToTxns, block, stxos)
-
-	// Add all of the index entries for each address.
-	addrIdxBucket := dbTx.Metadata().Bucket(addrIndexKey)
-	for addrKey, txIdxs := range addrsToTxns {
-		for _, txIdx := range txIdxs {
-			err := dbPutAddrIndexEntry(addrIdxBucket, addrKey,
-				blockID, txLocs[txIdx])
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	// Use the batch connect path with a single block.  It produces an
+	// identical result while coalescing the entries for each address into
+	// a single update applied in sorted key order, which avoids a random
+	// database read for every transaction that involves a repeated
+	// address.
+	return idx.ConnectBlocks(dbTx, []*btcutil.Block{block},
+		[][]blockchain.SpentTxOut{stxos})
 }
 
 // ConnectBlocks is invoked by the index manager during initial index catchup
